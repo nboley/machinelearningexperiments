@@ -22,7 +22,12 @@ from scipy.linalg import lstsq
 from scipy.stats import f
 
 #print numpy.random.seed()
-#numpy.random.seed(int(sys.argv[1]))
+try: 
+    numpy.random.seed(int(sys.argv[1]))
+except:
+    seed = random.randrange(100)
+    print "SEED:", seed
+    numpy.random.seed(seed)
 
 VERBOSE = False 
 REVERSE_CAUSALITY = False
@@ -115,16 +120,19 @@ def estimate_covariates(sample1, sample2, i):
 
 
 def estimate_skeleton_from_samples(sample1, sample2, labels, thresh_ratio=10):
-    G = nx.Graph()
+    G = nx.DiGraph()
     for i in xrange(sample1.shape[0]):
         G.add_node(i, label=labels[i])
         alpha, regression_coefs = estimate_covariates(sample1, sample2, i)
         max_coef = max(regression_coefs)
         print i, alpha, regression_coefs
         for j, val in enumerate(regression_coefs):
-            if abs(val) >= max_coef/thresh_ratio:
+            if abs(val) > 1e-6 and abs(val) >= max_coef/thresh_ratio:
                 G.add_edge(i, j, weight=val)
-    return G
+    # remove non bi-directed edges
+    for a, b in list(G.edges()):
+        if not G.has_edge(b, a): G.remove_edge(a, b)
+    return G.to_undirected()
 
 def find_unoriented_edges(G):
     unoriented_edges = set()
@@ -314,6 +322,44 @@ def iter_all_subsets_of_siblings(G, node):
             yield subset
     return
 
+def brute_force_find_all_consistent_dags(pdag, data):
+    def get_undirected_edges(G):
+        undirected_edges = []
+        for a, b in G.edges():
+            if G.has_edge(b, a):
+                undirected_edges.append( (a,b) )
+        return undirected_edges
+    
+    def orient_edge_and_propogate_changes(G, a, b):
+        G = G.copy()
+        G.remove_edge(b, a)
+        #orient_v_structures(G, data)
+        while apply_IC_rules(G): pass
+        return G
+
+    # the dags that we've found
+    dags = []
+    # stack containing both edges that we have already oriented, and 
+    # the current pdag after those edges have been oriented
+    stack = [ [[(a,b),], orient_edge_and_propogate_changes(pdag, a, b)]
+              for a, b in get_undirected_edges(pdag) ]
+    while len(stack) > 0:
+        oriented_edges, curr_pdag = stack.pop()
+        edges_to_orient = get_undirected_edges(curr_pdag)
+        # if there are no more edges to orient, then make sure that we haven't 
+        # already seen it and that it is acyclic, and add it
+        if len(edges_to_orient) == 0: 
+            if (not any(set(curr_pdag.edges()) == set(x.edges()) for x in dags)
+                    and nx.is_directed_acyclic_graph(curr_pdag)):
+                dags.append(curr_pdag)
+        else:
+            for a, b in edges_to_orient:
+                new_pdag = orient_edge_and_propogate_changes(curr_pdag, a, b)
+                stack.append([oriented_edges + [(a, b),], new_pdag])
+    
+    return dags
+
+
 def plot_pdag(pdag, real_G):
     real_G_layout = hierarchical_layout(real_G)
     #nx.draw(est_G, nx.graphviz_layout(est_G,prog='twopi',args=''))
@@ -325,21 +371,24 @@ def plot_pdag(pdag, real_G):
     return
 
 def main():
-    real_G = simulate_causal_graph(1, 2)
+    real_G = simulate_causal_graph(2, 2)
     #nx.draw(real_G, layout, node_size=1500, node_color='blue')
     #plt.show()
     #return
 
-    labels, sample1 = simulate_data_from_causal_graph(real_G, 100, 0.5)
-    labels, sample2 = simulate_data_from_causal_graph(real_G, 100, 0.5)
+    labels, sample1 = simulate_data_from_causal_graph(real_G, 10, 0.5)
+    labels, sample2 = simulate_data_from_causal_graph(real_G, 10, 0.5)
     
     print "Penalized Regression:"
     pdag = estimate_pdag(sample1, sample2, labels)
-    
-    for x in iter_all_subsets_of_siblings(pdag, 0):
-        print x
-
     plot_pdag(pdag, real_G)
+    
+    for x in brute_force_find_all_consistent_dags(
+            pdag, numpy.hstack((sample1, sample2))):
+        print x.edges()
+        plot_pdag(x, real_G)
+    
+    
 
     return
 
