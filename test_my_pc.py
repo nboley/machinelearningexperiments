@@ -2,9 +2,11 @@ import os, sys
 
 import math
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from itertools import combinations
+
+import multiprocessing
 
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -23,6 +25,8 @@ from sklearn.feature_selection import f_regression
 from scipy.linalg import lstsq
 from scipy.stats import f, norm, pearsonr
 
+N_THREADS = 30
+
 #print numpy.random.seed()
 try: 
     numpy.random.seed(int(sys.argv[1]))
@@ -32,8 +36,11 @@ except:
     numpy.random.seed(seed)
 # 82 is a good seed 
 
-VERBOSE = False 
+DEBUG_VERBOSE = False 
+VERBOSE = True 
 REVERSE_CAUSALITY = False
+
+ALPHA = 0.01
 
 def partial_corr(C):
     inv_cov = pinv(numpy.cov(C))
@@ -156,31 +163,69 @@ def estimate_skeleton_from_samples(sample1, sample2, labels, thresh_ratio=1000):
 
 def estimate_marginal_correlations(merged_samples, resp_index, 
                                    min_num_neighbors=1, 
-                                   max_num_neighbors=12,
-                                   alpha=0.05):
+                                   alpha=ALPHA):
     sig_samples = []
     response = merged_samples[resp_index,:]
     for i, row in enumerate(merged_samples):
-        if i == resp_index: continue
+        if i <= resp_index: continue
         corr_coef, p_value = pearsonr(row, response)
         if p_value < alpha or len(sig_samples) < min_num_neighbors: 
             sig_samples.append((p_value, corr_coef, i))
     sig_samples.sort(key=lambda x: (x[0], -x[1]))
-    return sig_samples[:max_num_neighbors]
+    return sig_samples
 
-def estimate_initial_skeleton(sample1, sample2, labels, thresh_ratio=1000):
-    # merge and mnormalize the data
-    merged_samples = numpy.hstack((sample1, sample2))
-    merged_samples = ((merged_samples.T)/(merged_samples.sum(1))).T
-    
+def estimate_initial_skeleton_singlethread(normalized_data, labels, thresh_ratio=1000):
     # initialize a graph storing the covariance structure
     G = nx.Graph()
-    for i in xrange(sample1.shape[0]):
+    for i in xrange(normalized_data.shape[0]):
+        #if i >= 5: break
+        marginal_dep = estimate_marginal_correlations(normalized_data, i)
+        print i, normalized_data.shape[0], labels[i], len(marginal_dep)
         if not G.has_node(i): G.add_node(i, label=labels[i])
-        for p, corr, j in estimate_marginal_correlations(merged_samples, i):
+        for p, corr, j in marginal_dep:
             if not G.has_node(j): G.add_node(j, label=labels[j])
-            G.add_edge(i, j, corr=corr)
+            G.add_edge(i, j, corr=corr, marginal_p=p)
     
+    return G
+
+def estimate_initial_skeleton(normalized_data, labels):
+    # initialize a graph storing the covariance structure
+    manager = multiprocessing.Manager()
+    edges_and_data = manager.list()
+    curr_node = multiprocessing.Value('i', 0)
+    pids = []
+    for p_index in xrange(N_THREADS):
+        pid = os.fork()
+        if pid == 0:
+            while True:
+                with curr_node.get_lock():
+                    node = curr_node.value
+                    if node >= normalized_data.shape[0]: break
+                    curr_node.value += 1
+                marginal_dep = estimate_marginal_correlations(
+                    normalized_data,node)
+                edges_and_data.append((node, marginal_dep ))
+                print node, normalized_data.shape[0], len(marginal_dep)
+            os._exit(0)
+        else:
+            pids.append(pid)
+    try:
+        for pid in pids:
+            os.waitpid(pid, 0)
+    except:
+        for pid in pids:
+            os.kill(pid, signal.SIGTERM)
+        raise
+    
+    print "Building graph skeleton from marginal independence data"
+    G = nx.Graph()
+    for i, data in edges_and_data:
+        if not G.has_node(i): G.add_node(i, label=labels[i])
+        for p, corr, j in data:
+            if not G.has_node(j): G.add_node(j, label=labels[j])
+            G.add_edge(i, j, corr=corr, marginal_p=p)
+    
+    manager.shutdown()
     return G
 
 
@@ -218,28 +263,6 @@ def iter_colliders(G):
                 yield n1, node, n2
     return
 
-def are_cond_indep(a, b, c, data):
-    N = data.shape[1]
-    ones = numpy.ones((N,1), dtype=float)
-    a_val = data[(a,),:].T
-    b_val = data[(b,),:].T
-    c_val = data[(c,),:].T
-
-    sln, rss_1, rank, s = lstsq(numpy.hstack((ones, c_val)), a_val)
-    sln, rss_2, rank, s = lstsq(numpy.hstack((ones, c_val, b_val)), a_val)
-    a_fstat = N*(rss_1 - rss_2)/rss_2
-
-    sln, rss_1, rank, s = lstsq(numpy.hstack((ones, c_val)), a_val)
-    sln, rss_2, rank, s = lstsq(numpy.hstack((ones, c_val, b_val)), a_val)
-    b_fstat = N*(rss_1 - rss_2)/rss_2
-
-    critical_value = f.isf([1e-2,], 1, N-2)
-    #print a, b, c, a_fstat, b_fstat, critical_value
-    if a_fstat < critical_value and b_fstat < critical_value:
-        return True
-    else:
-        return False
-
 def orient_single_v_structure(G, data):
     for a, c, b in iter_unoriented_v_structures(G):
         if not are_cond_indep(a, b, c, data):
@@ -253,19 +276,7 @@ def orient_single_v_structure(G, data):
                 print "Orienting %s->%s<-%s" % (
                     G.node[a]['label'], G.node[c]['label'], G.node[b]['label'])
             return True
-        else:
-            continue
-            ### THIS IS WRONG 
-            # remove the edges point from c to a and b
-            try: G.remove_edge(a, c)
-            except: pass
-            try: G.remove_edge(b, c)
-            except: pass
-            
-            if VERBOSE:
-                print "Orienting %s->%s<-%s" % (
-                    G.node[a]['label'], G.node[c]['label'], G.node[b]['label'])
-            return True
+    
     return False
 
 def orient_v_structures(G, ci_sets):
@@ -345,19 +356,19 @@ def apply_IC_rules(G):
     unoriented_edges = find_unoriented_edges(G)
     for a, b in unoriented_edges:
         if apply_rule_1(a, b, G):
-            if VERBOSE: print "Applying Rule 1:", a, b
+            if DEBUG_VERBOSE: print "Applying Rule 1:", a, b
             G.remove_edge(b ,a)
             return True
         elif apply_rule_2(a, b, G):
-            if VERBOSE: print "Applying Rule 2:", a, b
+            if DEBUG_VERBOSE: print "Applying Rule 2:", a, b
             G.remove_edge(b ,a)
             return True
         elif apply_rule_3(a, b, G):
-            if VERBOSE: print "Applying Rule 3:", a, b
+            if DEBUG_VERBOSE: print "Applying Rule 3:", a, b
             G.remove_edge(b ,a)
             return True
         elif apply_rule_4(a, b, G):
-            if VERBOSE: print "Applying Rule 4:", a, b
+            if DEBUG_VERBOSE: print "Applying Rule 4:", a, b
             G.remove_edge(b ,a)
             return True
     return False
@@ -383,66 +394,104 @@ def break_cycles(G):
         cycles = nx.cycle_basis(G)
     return G
 
-def estimate_pdag_OLD(sample1, sample2, labels):
-    skeleton = estimate_skeleton_from_samples(sample1, sample2, labels)
-    skeleton = break_cycles(skeleton)
-    est_G = skeleton.to_directed()
-    orient_v_structures(est_G, numpy.hstack((sample1, sample2)))
-    applied_rule = True
-    while apply_IC_rules(est_G): pass
-    #assert False
-    return est_G
+def test_for_CI(G, n1, n2, normalized_data, order, alpha):
+    """Test if n1 and n2 are conditionally independent. 
 
-def apply_pc_iteration(G, sample1, sample2, order, alpha=0.05):
-    # combine and normalize the samples
-    merged_samples = numpy.hstack((sample1, sample2))
-    merged_samples = ((merged_samples.T)/(merged_samples.sum(1))).T
+    If they are not return None, else return the conditional independence set.
+    """
+    N = normalized_data.shape[1]
+    ones = numpy.ones((N,1), dtype=float)
     
+    n1_resp = normalized_data[n1,:]    
+    n1_neighbors = set(G.neighbors(n1))    
+    
+    n2_resp = normalized_data[n2,:]
+    n2_neighbors = set(G.neighbors(n2))
+    
+    common_neighbors = n1_neighbors.intersection(n2_neighbors) - set((n1, n2))
+    # if there aren't enough neighbors common to n1 and n2, return none
+    if len(common_neighbors) < order: 
+        return None
+    
+    min_score = 1e100
+    best_p_val = None
+    best_neighbors = None
+    n_common_neighbors = 0
+    for covariates in combinations(common_neighbors, order):
+        n_common_neighbors += 1
+        predictors = numpy.hstack(
+            (ones, normalized_data[numpy.array(covariates),:].T))
+        # test if node is independent of neighbors given for some subset
+        rv1, _, _, _ = lstsq(predictors, n1_resp)
+        rv2, _, _, _ = lstsq(predictors, n2_resp)
+        cor, pval =  pearsonr(n1_resp - rv1.dot(predictors.T), 
+                              n2_resp - rv2.dot(predictors.T))
+        if abs(cor) < min_score:
+            min_score = abs(cor)
+            best_neighbors = covariates
+            best_p_val = pval
+        #score = math.sqrt(N-order-3)*0.5*math.log((1+cor)/(1-cor))
+        #print abs(score),  norm.isf(alpha/(len(neighbors)*2)), cor, pval
+        #if abs(score) < norm.isf(alpha/(len(neighbors)*2)): 
+    
+    # make the multiple testing correction
+    if best_p_val/n_common_neighbors < alpha:
+        return None
+    else:
+        return best_neighbors
+
+def apply_pc_iteration(G, normalized_data, order, alpha=ALPHA):    
     cond_independence_sets = defaultdict(set)
     
-    N = merged_samples.shape[1]
-    ones = numpy.ones((N,1), dtype=float)
-    for n1 in G.nodes():
-        n1_resp = merged_samples[n1,:]
-        n1_neighbors = set(G.neighbors(n1))
+    ## we can't estimate higher order interactiosn than we have samples
+    #N = normalized_data.shape[1]
+    #if N - order - 3 <= 0:
+    #    return cond_independence_sets
+
+    num_nodes = len(G.nodes())
+    for n1 in G.nodes():    
+        n1_neighbors = sorted(
+            G.neighbors(n1), key=lambda n2: G[n1][n2]['marginal_p'])
+        num_neighbors = len(n1_neighbors)
+        if VERBOSE:
+            print "Test O%i: %i/%i %i neighbors ... " % (
+                order, n1, num_nodes, num_neighbors),
+
         for n2 in n1_neighbors:
             if n2 <= n1: continue
-            n2_resp = merged_samples[n2,:]
-            n2_neighbors = set(G.neighbors(n2))
-            neighbors = n1_neighbors.intersection(n2_neighbors) - set((n1, n2))
-            if len(neighbors) < order: continue
-            for covariates in combinations(neighbors, order):
-                predictors = numpy.hstack(
-                    (ones, merged_samples[numpy.array(covariates),:].T))
-                # test if node is independent of neighbors given for some subset
-                rv1, _, _, _ = lstsq(predictors, n1_resp)
-                rv2, _, _, _ = lstsq(predictors, n2_resp)
-                cor, pval =  pearsonr(n1_resp - rv1.dot(predictors.T), 
-                                      n2_resp - rv2.dot(predictors.T))
-                score = math.sqrt(N-order-3)*0.5*math.log((1+cor)/(1-cor))
-                if abs(score) < norm.isf(alpha/2): 
-                    print "Test: %s IND %s|{%s}" % (
-                        G.node[n1]['label'], G.node[n2]['label'], 
-                        ','.join(G.node[int(x)]['label'] for x in covariates)),
-                    print cor, pval, score, norm.isf(alpha/2)
-
-                    # we may have already removed this edge
-                    if G.has_edge(n1, n2): G.remove_edge(n1, n2)
-                    cond_independence_sets[(n1, n2)].update(
-                        int(x) for x in covariates)
-                    cond_independence_sets[(n2, n1)].update(
-                        int(x) for x in covariates)
-
+            are_CI = test_for_CI(G, n1, n2, normalized_data, order, alpha)
+            if are_CI == None:
+                pass
+                if DEBUG_VERBOSE: print "%i NOT CI of %i" % (n1, n2)
+            else:
+                if DEBUG_VERBOSE:
+                    print "%i IS CI %i | %s" % (
+                        n1, n2, ",".join(str(x) for x in are_CI))
+                cond_independence_sets[(n1, n2)].add(are_CI)
+                G.remove_edge(n1, n2)
+                num_neighbors -= 1
+        if VERBOSE: 
+            print "%i remain (%i removed)" % (
+                num_neighbors, len(n1_neighbors) - num_neighbors)
+    
     return cond_independence_sets
 
 def estimate_pdag(sample1, sample2, labels):
-    skeleton = estimate_initial_skeleton(sample1, sample2, labels)
+    # combine and normalize the samples
+    normalized_data = numpy.hstack((sample1, sample2))
+    normalized_data = ((normalized_data.T)/(normalized_data.sum(1))).T
+
+    skeleton = estimate_initial_skeleton(normalized_data, labels)
+    nx.write_gml(skeleton, "skeleton.gml")
+    
+    curr_pdag = skeleton.copy()
     cond_independence_sets = defaultdict(set)
-    for i in xrange(1,6):
-        inner_cis = apply_pc_iteration( skeleton, sample1, sample2, i )
+    for i in xrange(1,normalized_data.shape[1]-3+1):
+        inner_cis = apply_pc_iteration( curr_pdag, normalized_data, i )
         for key, vals in inner_cis.items():
             cond_independence_sets[key].update(vals)
-        
+        print i, len(nx.connected_component_subgraphs(curr_pdag))
+    
     #skeleton = break_cycles(skeleton)
     est_G = skeleton.to_directed()
     orient_v_structures(est_G, cond_independence_sets)
@@ -569,7 +618,7 @@ def plot_pdag(pdag, real_G):
     plt.show()
     return
 
-def main():
+def test():
     real_G = simulate_causal_graph(2, 2)
     #nx.draw(real_G, hierarchical_layout(real_G), node_size=1500, node_color='blue')
     #plt.show()
@@ -588,6 +637,37 @@ def main():
     
     
 
+    return
+
+def load_data():
+    samples = None
+    genes = []
+    expression = []
+    with open("all_quant.txt") as fp:
+        for i, line in enumerate(fp):
+            data = line.split()
+            if i == 0:
+               samples = data[1:]
+               continue
+            # append the gene name
+            gene_expression = numpy.array(map(float, data[1:]))
+            if numpy.max(gene_expression) < 100: continue
+            genes.append(data[0])
+            # add random normal noise to the gene expressionvalues to prevent 
+            # high correlation artifacts due to rounding error, etc. 
+            gene_expression += (numpy.random.randn(len(gene_expression)))**2
+            expression.append( gene_expression )
+    
+    expression = numpy.vstack(expression)
+    s1 = expression[:,(3,0,5)]
+    s2 = expression[:,(4,2,7)]
+    return genes, s1, s2
+
+def main():
+    genes, sample1, sample2 = load_data()
+    pdag, cond_independence_sets = estimate_pdag(sample1, sample2, genes)
+    nx.write_gml(pdag.to_undirected(pdag), "expression_GT_3000_pdag.gml")
+    print pdag
     return
 
 main()
