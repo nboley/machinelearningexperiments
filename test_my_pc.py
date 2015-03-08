@@ -440,7 +440,7 @@ def test_for_CI(G, n1, n2, normalized_data, order, alpha):
     else:
         return best_neighbors
 
-def apply_pc_iteration(G, normalized_data, order, alpha=ALPHA):    
+def apply_pc_iteration_serial(G, normalized_data, order, alpha=ALPHA):    
     cond_independence_sets = defaultdict(set)
     
     ## we can't estimate higher order interactiosn than we have samples
@@ -476,13 +476,76 @@ def apply_pc_iteration(G, normalized_data, order, alpha=ALPHA):
     
     return cond_independence_sets
 
+def find_edges_to_remove_for_single_node(G, n1, normalized_data, order, alpha):
+    cond_independence_sets = defaultdict(set)
+    
+    n1_neighbors = sorted(
+        G.neighbors(n1), key=lambda n2: G[n1][n2]['marginal_p'])
+    num_neighbors = len(n1_neighbors)
+
+    for n2 in n1_neighbors:
+        if n2 <= n1: continue
+        are_CI = test_for_CI(G, n1, n2, normalized_data, order, alpha)
+        if are_CI == None:
+            if DEBUG_VERBOSE: print "%i NOT CI of %i" % (n1, n2)
+        else:
+            if DEBUG_VERBOSE:
+                print "%i IS CI %i | %s" % (
+                    n1, n2, ",".join(str(x) for x in are_CI))
+            cond_independence_sets[(n1, n2)].add(are_CI)
+            num_neighbors -= 1
+    if VERBOSE: 
+        print "Test O%i: %i/%i %i neighbors ... %i remain (%i removed)" % (
+            order, n1, num_nodes, len(n1_neighbors), 
+            num_neighbors, len(n1_neighbors) - num_neighbors)
+    
+    return cond_independence_sets
+
+def find_edges_to_remove(G, normalized_data, order, alpha=ALPHA):    
+    cond_independence_sets = {}
+    
+    num_nodes = len(G.nodes())
+    for n1 in G.nodes():    
+        edges_to_remove = find_edges_to_remove(
+            G, n1, normalized_data, order, alpha)
+        for edge, ci_sets in cond_independence_sets:
+            assert edge not in cond_independence_sets
+            cond_independence_sets[edge] = ci_sets
+    
+    return cond_independence_sets
+
+def partition_nodes_into_nonadjacent_sets(G):
+    grouped_nodes = set()
+    nodes_sets = []
+    while len(grouped_nodes) < len(G):
+        nodes_sets.append( [] )
+        remaining_nodes = set(G.nodes())
+        for node in G.nodes():
+            # skip nodes htat we've already grouped
+            if node in grouped_nodes: continue
+            # skip nodes that are neighbors to nodes already in the set
+            if node not in remaining_nodes: continue
+            # add the node to the latest set, and mark it as having
+            # been added
+            nodes_sets[-1].append(node)
+            grouped_nodes.add(node)
+            # remove neighbots of this node from the set of nodes that
+            # can still be considered
+            remaining_nodes.remove(node)
+            remaining_nodes.difference_update(G.neighbors(node))
+    return nodes_sets
+
+
 def estimate_pdag(sample1, sample2, labels):
     # combine and normalize the samples
     normalized_data = numpy.hstack((sample1, sample2))
     normalized_data = ((normalized_data.T)/(normalized_data.sum(1))).T
 
     skeleton = estimate_initial_skeleton(normalized_data, labels)
-    nx.write_gml(skeleton, "skeleton.gml")
+    #nx.write_gml(skeleton, "skeleton.gml")
+
+    print partition_nodes_into_nonadjacent_sets(skeleton)
+    assert False
     
     curr_pdag = skeleton.copy()
     cond_independence_sets = defaultdict(set)
@@ -635,8 +698,6 @@ def test():
         print x.edges()
         plot_pdag(x, real_G)
     
-    
-
     return
 
 def load_data():
@@ -651,7 +712,7 @@ def load_data():
                continue
             # append the gene name
             gene_expression = numpy.array(map(float, data[1:]))
-            if numpy.max(gene_expression) < 100: continue
+            if numpy.max(gene_expression) < 1000: continue
             genes.append(data[0])
             # add random normal noise to the gene expressionvalues to prevent 
             # high correlation artifacts due to rounding error, etc. 
@@ -670,4 +731,6 @@ def main():
     print pdag
     return
 
-main()
+if __name__ == '__main__':
+    #main()
+    test()
