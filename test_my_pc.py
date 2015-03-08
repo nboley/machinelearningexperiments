@@ -7,6 +7,7 @@ from collections import defaultdict, OrderedDict
 from itertools import combinations
 
 import multiprocessing
+import signal
 
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -25,7 +26,7 @@ from sklearn.feature_selection import f_regression
 from scipy.linalg import lstsq
 from scipy.stats import f, norm, pearsonr
 
-N_THREADS = 16
+N_THREADS = 32
 
 #print numpy.random.seed()
 try: 
@@ -36,12 +37,13 @@ except:
     numpy.random.seed(seed)
 # 82 is a good seed 
 
-DEBUG_VERBOSE = True 
+DEBUG_VERBOSE = False 
 VERBOSE = True 
 REVERSE_CAUSALITY = True
 
-ALPHA = 0.05
+ALPHA = 0.01
 MAX_ORDER = 8
+MIN_TPM = 2
 
 def partial_corr(C):
     inv_cov = pinv(numpy.cov(C))
@@ -163,24 +165,37 @@ def estimate_skeleton_from_samples(sample1, sample2, labels, thresh_ratio=1000):
     return G.to_undirected()
 
 def estimate_marginal_correlations(merged_samples, resp_index, alpha=ALPHA,
-                                   min_num_neighbors=0 ):
+                                   min_num_neighbors=0, max_num_neighbors=10000 ):
     sig_samples = []
     response = merged_samples[resp_index,:]
+    rep1 = numpy.array((0,1,2))
+    rep2 = numpy.array((3,4,5))
     for i, row in enumerate(merged_samples):
         if i <= resp_index: continue
-        corr_coef, p_value = pearsonr(row, response)
+        corr_coef1, p_value1 = pearsonr(row[rep1], response[rep2])
+        corr_coef2, p_value2 = pearsonr(row[rep2], response[rep1])
+        if p_value1 < p_value2:
+            p_value = p_value1
+            corr_coef = corr_coef1
+        else:
+            p_value = p_value2
+            corr_coef = corr_coef2
+        #print p_value, corr_coef
         if p_value < alpha or len(sig_samples) < min_num_neighbors: 
             sig_samples.append((p_value, corr_coef, i))
     sig_samples.sort(key=lambda x: (x[0], -x[1]))
-    while len(sig_samples) > min_num_neighbors and sig_samples[-1][0] > alpha:
+    while (len(sig_samples) > min_num_neighbors 
+           and sig_samples[-1][0] > alpha)/len(merged_samples):
         del sig_samples[-1]
-    return sig_samples
+    return sig_samples[:max_num_neighbors]
 
 def estimate_initial_skeleton(normalized_data, labels, alpha):
+    print "Estimating marginal independence relationships"
     # initialize a graph storing the covariance structure
     manager = multiprocessing.Manager()
     edges_and_data = manager.list()
     curr_node = multiprocessing.Value('i', 0)
+    n_nodes = normalized_data.shape[0]
     pids = []
     for p_index in xrange(N_THREADS):
         pid = os.fork()
@@ -188,8 +203,11 @@ def estimate_initial_skeleton(normalized_data, labels, alpha):
             while True:
                 with curr_node.get_lock():
                     node = curr_node.value
-                    if node >= normalized_data.shape[0]: break
+                    if node >= n_nodes: break
                     curr_node.value += 1
+                if node%100 == 0: 
+                    print "O0: Finished processing %i/%i nodes" % (
+                        node, n_nodes)
                 marginal_dep = estimate_marginal_correlations(
                     normalized_data, node, alpha)
                 edges_and_data.append((node, marginal_dep ))
@@ -204,7 +222,7 @@ def estimate_initial_skeleton(normalized_data, labels, alpha):
             os.kill(pid, signal.SIGTERM)
         raise
     
-    print "Building graph skeleton from marginal independence data"
+    print "Building O0 graph skeleton from marginal independence data"
     G = nx.Graph()
     for i, data in edges_and_data:
         if not G.has_node(i): G.add_node(i, label=labels[i])
@@ -419,12 +437,15 @@ def test_for_CI(G, n1, n2, normalized_data, order, alpha):
             min_score = abs(cor)
             best_neighbors = covariates
             best_p_val = pval
+        # make the multiple testing correction /n_common_neighbors
+        if best_p_val < alpha/n_common_neighbors:
+            return None
         #score = math.sqrt(N-order-3)*0.5*math.log((1+cor)/(1-cor))
         #print abs(score),  norm.isf(alpha/(len(neighbors)*2)), cor, pval
         #if abs(score) < norm.isf(alpha/(len(neighbors)*2)): 
     
     # make the multiple testing correction /n_common_neighbors
-    if best_p_val < alpha:
+    if best_p_val < alpha/n_common_neighbors:
         return None
     else:
         return best_neighbors
@@ -442,7 +463,7 @@ def apply_pc_iteration_serial(G, normalized_data, order, alpha=ALPHA):
         n1_neighbors = sorted(
             G.neighbors(n1), key=lambda n2: G[n1][n2]['marginal_p'])
         num_neighbors = len(n1_neighbors)
-        if VERBOSE:
+        if DEBUG_VERBOSE:
             print "Test O%i: %i/%i %i neighbors ... " % (
                 order, n1, num_nodes, num_neighbors),
 
@@ -477,6 +498,7 @@ def remove_edges_for_single_node(G, n1, normalized_data, order, alpha):
 
     for n2 in n1_neighbors:
         if n2 <= n1: continue
+        if num_neighbors-1 <= order: break
         are_CI = test_for_CI(G, n1, n2, normalized_data, order, alpha)
         if are_CI == None:
             if DEBUG_VERBOSE: print "%i NOT CI of %i" % (n1, n2)
@@ -486,7 +508,7 @@ def remove_edges_for_single_node(G, n1, normalized_data, order, alpha):
                     n1, n2, ",".join(str(x) for x in are_CI))
             cond_independence_sets[(n1, n2)].update(are_CI)
             num_neighbors -= 1
-    if VERBOSE: 
+    if DEBUG_VERBOSE: 
         print "Test O%i: %i/%i %i neighbors ... %i remain (%i removed)" % (
             order, n1, len(G), len(n1_neighbors), 
             num_neighbors, len(n1_neighbors) - num_neighbors)
@@ -509,10 +531,11 @@ def find_edges_to_remove(G, normalized_data, order, alpha=ALPHA):
 def partition_nodes_into_nonadjacent_sets(G):
     grouped_nodes = set()
     nodes_sets = []
+    degree_sorted_nodes = sorted(G.degree().items(), key=lambda x:-x[1])
     while len(grouped_nodes) < len(G):
         nodes_sets.append( [] )
         remaining_nodes = set(G.nodes())
-        for node in G.nodes():
+        for node, degree in degree_sorted_nodes:
             # skip nodes htat we've already grouped
             if node in grouped_nodes: continue
             # skip nodes that are neighbors to nodes already in the set
@@ -539,9 +562,8 @@ def find_CI_relationships_in_subprocess(
         if node == None: break
         node_CI_sets = remove_edges_for_single_node(
             curr_skeleton, node, normalized_data, ind_order, alpha)
-        for edge, CI_set in node_CI_sets.iteritems() :
-            assert edge not in shared_edges_to_remove
-            shared_edges_to_remove[edge] = CI_set
+        for edge, CI_set in node_CI_sets.iteritems():
+            shared_edges_to_remove.put((edge, CI_set))
     return
 
 def estimate_pdag(sample1, sample2, labels, alpha=ALPHA):
@@ -551,21 +573,28 @@ def estimate_pdag(sample1, sample2, labels, alpha=ALPHA):
     
     skeleton = estimate_initial_skeleton(
         normalized_data, labels, alpha=alpha)
+    nx.write_gml(skeleton, "skeleton_O0.gml")
 
-    manager = multiprocessing.Manager()
     cond_independence_sets = {}
     for ind_order in xrange(1,min(MAX_ORDER,min(normalized_data.shape)-2+1)):
         nonadjacent_node_sets = partition_nodes_into_nonadjacent_sets(skeleton)
-        for nonadjacent_nodes in nonadjacent_node_sets:
-            new_cond_independence_sets = manager.dict()
+        print "O%i: Processing cluster %i/%i: %i/%i nodes remain" % (
+            ind_order, 1, len(nonadjacent_node_sets),
+            sum(len(x) for i, x in enumerate(nonadjacent_node_sets) 
+                if i >= 0),
+            sum(len(x) for x in nonadjacent_node_sets))
+
+        for cluster_i, nonadjacent_nodes in enumerate(nonadjacent_node_sets):
+            new_cond_independence_sets = multiprocessing.Queue()
             # populate the queue
+            n_threads_to_spawn = min(N_THREADS, len(nonadjacent_nodes))
             nodes_queue = multiprocessing.Queue()
             for node in nonadjacent_nodes: nodes_queue.put(node)
-            for i in xrange(N_THREADS): nodes_queue.put(None)
+            for i in xrange(n_threads_to_spawn): nodes_queue.put(None)
 
             # spaqwn worker processes
             pids = []
-            for i in xrange(N_THREADS):
+            for i in xrange(n_threads_to_spawn):
                 pid = os.fork()
                 if pid == 0:
                     find_CI_relationships_in_subprocess(
@@ -574,7 +603,6 @@ def estimate_pdag(sample1, sample2, labels, alpha=ALPHA):
                     os._exit(0)
                 else:
                     pids.append(pid)
-            # joint he children
             try:
                 for pid in pids:
                     os.waitpid(pid, 0)
@@ -582,14 +610,22 @@ def estimate_pdag(sample1, sample2, labels, alpha=ALPHA):
                 for pid in pids:
                     os.kill(pid, signal.SIGTERM)
                 raise
-
+            print "O%i: Finished processing cluster %i/%i: %i/%i nodes remain" % (
+                ind_order, cluster_i+1, len(nonadjacent_node_sets),
+                sum(len(x) for i, x in enumerate(nonadjacent_node_sets) 
+                    if i > cluster_i),
+                sum(len(x) for x in nonadjacent_node_sets))
+            
             # update the global cond_independence_sets
-            for edge, CI_set in new_cond_independence_sets.items():
+            while not new_cond_independence_sets.empty():
+                edge, CI_set = new_cond_independence_sets.get()
                 assert edge not in cond_independence_sets
                 cond_independence_sets[edge] = CI_set
                 skeleton.remove_edge(*edge)
-    
-    manager.shutdown()
+
+        print "Writing O%i skeleton to disk" % ind_order        
+        nx.write_gml(skeleton, "skeleton_O%i.gml" % ind_order)
+
     
     est_G = skeleton.to_directed()
     orient_v_structures(est_G, cond_independence_sets)
@@ -728,7 +764,7 @@ def load_data():
                continue
             # append the gene name
             gene_expression = numpy.array(map(float, data[1:]))
-            if numpy.max(gene_expression) < 1000: continue
+            if numpy.max(gene_expression) < MIN_TPM: continue
             genes.append(data[0])
             # add random normal noise to the gene expressionvalues to prevent 
             # high correlation artifacts due to rounding error, etc. 
@@ -743,7 +779,7 @@ def load_data():
 def main():
     genes, sample1, sample2 = load_data()
     pdag, cond_independence_sets = estimate_pdag(sample1, sample2, genes)
-    nx.write_gml(pdag.to_undirected(pdag), "expression_GT_3000_pdag.gml")
+    nx.write_gml(pdag, "expression_GT_%i_pdag.gml" % MIN_TPM)
     print pdag
     return
 
@@ -768,5 +804,5 @@ def test():
 
 
 if __name__ == '__main__':
-    #main()
-    test()
+    main()
+    #test()
