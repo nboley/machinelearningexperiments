@@ -25,7 +25,7 @@ from sklearn.feature_selection import f_regression
 from scipy.linalg import lstsq
 from scipy.stats import f, norm, pearsonr
 
-N_THREADS = 30
+N_THREADS = 16
 
 #print numpy.random.seed()
 try: 
@@ -36,11 +36,12 @@ except:
     numpy.random.seed(seed)
 # 82 is a good seed 
 
-DEBUG_VERBOSE = False 
+DEBUG_VERBOSE = True 
 VERBOSE = True 
-REVERSE_CAUSALITY = False
+REVERSE_CAUSALITY = True
 
-ALPHA = 0.01
+ALPHA = 0.05
+MAX_ORDER = 8
 
 def partial_corr(C):
     inv_cov = pinv(numpy.cov(C))
@@ -161,9 +162,8 @@ def estimate_skeleton_from_samples(sample1, sample2, labels, thresh_ratio=1000):
     
     return G.to_undirected()
 
-def estimate_marginal_correlations(merged_samples, resp_index, 
-                                   min_num_neighbors=1, 
-                                   alpha=ALPHA):
+def estimate_marginal_correlations(merged_samples, resp_index, alpha=ALPHA,
+                                   min_num_neighbors=0 ):
     sig_samples = []
     response = merged_samples[resp_index,:]
     for i, row in enumerate(merged_samples):
@@ -172,23 +172,11 @@ def estimate_marginal_correlations(merged_samples, resp_index,
         if p_value < alpha or len(sig_samples) < min_num_neighbors: 
             sig_samples.append((p_value, corr_coef, i))
     sig_samples.sort(key=lambda x: (x[0], -x[1]))
+    while len(sig_samples) > min_num_neighbors and sig_samples[-1][0] > alpha:
+        del sig_samples[-1]
     return sig_samples
 
-def estimate_initial_skeleton_singlethread(normalized_data, labels, thresh_ratio=1000):
-    # initialize a graph storing the covariance structure
-    G = nx.Graph()
-    for i in xrange(normalized_data.shape[0]):
-        #if i >= 5: break
-        marginal_dep = estimate_marginal_correlations(normalized_data, i)
-        print i, normalized_data.shape[0], labels[i], len(marginal_dep)
-        if not G.has_node(i): G.add_node(i, label=labels[i])
-        for p, corr, j in marginal_dep:
-            if not G.has_node(j): G.add_node(j, label=labels[j])
-            G.add_edge(i, j, corr=corr, marginal_p=p)
-    
-    return G
-
-def estimate_initial_skeleton(normalized_data, labels):
+def estimate_initial_skeleton(normalized_data, labels, alpha):
     # initialize a graph storing the covariance structure
     manager = multiprocessing.Manager()
     edges_and_data = manager.list()
@@ -203,9 +191,8 @@ def estimate_initial_skeleton(normalized_data, labels):
                     if node >= normalized_data.shape[0]: break
                     curr_node.value += 1
                 marginal_dep = estimate_marginal_correlations(
-                    normalized_data,node)
+                    normalized_data, node, alpha)
                 edges_and_data.append((node, marginal_dep ))
-                print node, normalized_data.shape[0], len(marginal_dep)
             os._exit(0)
         else:
             pids.append(pid)
@@ -281,7 +268,9 @@ def orient_single_v_structure(G, data):
 
 def orient_v_structures(G, ci_sets):
     for a, c, b in iter_unoriented_v_structures(G):
-        if c not in ci_sets[(a,b)]:
+        # the a and b are marginally independent or they
+        # are independent conditionally on c orient the edges
+        if (a,b) not in ci_sets or c not in ci_sets[(a,b)]:
             # remove the edges point from c to a and b
             try: G.remove_edge(c, a)
             except: pass
@@ -434,8 +423,8 @@ def test_for_CI(G, n1, n2, normalized_data, order, alpha):
         #print abs(score),  norm.isf(alpha/(len(neighbors)*2)), cor, pval
         #if abs(score) < norm.isf(alpha/(len(neighbors)*2)): 
     
-    # make the multiple testing correction
-    if best_p_val/n_common_neighbors < alpha:
+    # make the multiple testing correction /n_common_neighbors
+    if best_p_val < alpha:
         return None
     else:
         return best_neighbors
@@ -461,13 +450,12 @@ def apply_pc_iteration_serial(G, normalized_data, order, alpha=ALPHA):
             if n2 <= n1: continue
             are_CI = test_for_CI(G, n1, n2, normalized_data, order, alpha)
             if are_CI == None:
-                pass
                 if DEBUG_VERBOSE: print "%i NOT CI of %i" % (n1, n2)
             else:
                 if DEBUG_VERBOSE:
                     print "%i IS CI %i | %s" % (
                         n1, n2, ",".join(str(x) for x in are_CI))
-                cond_independence_sets[(n1, n2)].add(are_CI)
+                cond_independence_sets[(n1, n2)].update(are_CI)
                 G.remove_edge(n1, n2)
                 num_neighbors -= 1
         if VERBOSE: 
@@ -476,9 +464,13 @@ def apply_pc_iteration_serial(G, normalized_data, order, alpha=ALPHA):
     
     return cond_independence_sets
 
-def find_edges_to_remove_for_single_node(G, n1, normalized_data, order, alpha):
+def remove_edges_for_single_node(G, n1, normalized_data, order, alpha):
+    # the edges removed, and their corresponding conditional independence sets
     cond_independence_sets = defaultdict(set)
     
+    # n1's neighbors, sorted by decreasing marginal p value. Since the algorithm
+    # is order depedent, all else being equal we prefer to remove edges that 
+    # have the lowest marginal correlation first
     n1_neighbors = sorted(
         G.neighbors(n1), key=lambda n2: G[n1][n2]['marginal_p'])
     num_neighbors = len(n1_neighbors)
@@ -492,11 +484,11 @@ def find_edges_to_remove_for_single_node(G, n1, normalized_data, order, alpha):
             if DEBUG_VERBOSE:
                 print "%i IS CI %i | %s" % (
                     n1, n2, ",".join(str(x) for x in are_CI))
-            cond_independence_sets[(n1, n2)].add(are_CI)
+            cond_independence_sets[(n1, n2)].update(are_CI)
             num_neighbors -= 1
     if VERBOSE: 
         print "Test O%i: %i/%i %i neighbors ... %i remain (%i removed)" % (
-            order, n1, num_nodes, len(n1_neighbors), 
+            order, n1, len(G), len(n1_neighbors), 
             num_neighbors, len(n1_neighbors) - num_neighbors)
     
     return cond_independence_sets
@@ -535,32 +527,74 @@ def partition_nodes_into_nonadjacent_sets(G):
             remaining_nodes.difference_update(G.neighbors(node))
     return nodes_sets
 
+def find_CI_relationships_in_subprocess(
+        normalized_data, skeleton, ind_order, alpha,
+        node_set_queue, shared_edges_to_remove):
+    # make a thread local copy of the graph (shouldnt be necessary on
+    # a fork, but to be safe... )
+    curr_skeleton = skeleton.copy()
+    while True:
+        node = node_set_queue.get()
+        # if there are no nodes left, break
+        if node == None: break
+        node_CI_sets = remove_edges_for_single_node(
+            curr_skeleton, node, normalized_data, ind_order, alpha)
+        for edge, CI_set in node_CI_sets.iteritems() :
+            assert edge not in shared_edges_to_remove
+            shared_edges_to_remove[edge] = CI_set
+    return
 
-def estimate_pdag(sample1, sample2, labels):
+def estimate_pdag(sample1, sample2, labels, alpha=ALPHA):
     # combine and normalize the samples
     normalized_data = numpy.hstack((sample1, sample2))
     normalized_data = ((normalized_data.T)/(normalized_data.sum(1))).T
-
-    skeleton = estimate_initial_skeleton(normalized_data, labels)
-    #nx.write_gml(skeleton, "skeleton.gml")
-
-    print partition_nodes_into_nonadjacent_sets(skeleton)
-    assert False
     
-    curr_pdag = skeleton.copy()
-    cond_independence_sets = defaultdict(set)
-    for i in xrange(1,normalized_data.shape[1]-3+1):
-        inner_cis = apply_pc_iteration( curr_pdag, normalized_data, i )
-        for key, vals in inner_cis.items():
-            cond_independence_sets[key].update(vals)
-        print i, len(nx.connected_component_subgraphs(curr_pdag))
+    skeleton = estimate_initial_skeleton(
+        normalized_data, labels, alpha=alpha)
+
+    manager = multiprocessing.Manager()
+    cond_independence_sets = {}
+    for ind_order in xrange(1,min(MAX_ORDER,min(normalized_data.shape)-2+1)):
+        nonadjacent_node_sets = partition_nodes_into_nonadjacent_sets(skeleton)
+        for nonadjacent_nodes in nonadjacent_node_sets:
+            new_cond_independence_sets = manager.dict()
+            # populate the queue
+            nodes_queue = multiprocessing.Queue()
+            for node in nonadjacent_nodes: nodes_queue.put(node)
+            for i in xrange(N_THREADS): nodes_queue.put(None)
+
+            # spaqwn worker processes
+            pids = []
+            for i in xrange(N_THREADS):
+                pid = os.fork()
+                if pid == 0:
+                    find_CI_relationships_in_subprocess(
+                        normalized_data, skeleton, ind_order, alpha, 
+                        nodes_queue, new_cond_independence_sets)
+                    os._exit(0)
+                else:
+                    pids.append(pid)
+            # joint he children
+            try:
+                for pid in pids:
+                    os.waitpid(pid, 0)
+            except:
+                for pid in pids:
+                    os.kill(pid, signal.SIGTERM)
+                raise
+
+            # update the global cond_independence_sets
+            for edge, CI_set in new_cond_independence_sets.items():
+                assert edge not in cond_independence_sets
+                cond_independence_sets[edge] = CI_set
+                skeleton.remove_edge(*edge)
     
-    #skeleton = break_cycles(skeleton)
+    manager.shutdown()
+    
     est_G = skeleton.to_directed()
     orient_v_structures(est_G, cond_independence_sets)
     applied_rule = True
     while apply_IC_rules(est_G): pass
-    #assert False
     return est_G, cond_independence_sets
 
 def hierarchical_layout(real_G):
@@ -681,24 +715,6 @@ def plot_pdag(pdag, real_G):
     plt.show()
     return
 
-def test():
-    real_G = simulate_causal_graph(2, 2)
-    #nx.draw(real_G, hierarchical_layout(real_G), node_size=1500, node_color='blue')
-    #plt.show()
-    #return
-
-    labels, sample1 = simulate_data_from_causal_graph(real_G, 3, 0.5)
-    labels, sample2 = simulate_data_from_causal_graph(real_G, 3, 0.5)
-    #print partial_corr(preprocessing.scale(numpy.hstack((sample1, sample2)).T).T)
-    #return
-    pdag, cond_independence_sets = estimate_pdag(sample1, sample2, labels)
-    plot_pdag(pdag, real_G)
-    for x in find_all_consistent_dags(
-            pdag, cond_independence_sets, real_G):
-        print x.edges()
-        plot_pdag(x, real_G)
-    
-    return
 
 def load_data():
     samples = None
@@ -730,6 +746,26 @@ def main():
     nx.write_gml(pdag.to_undirected(pdag), "expression_GT_3000_pdag.gml")
     print pdag
     return
+
+def test():
+    real_G = simulate_causal_graph(5, 5)
+    #nx.draw(real_G, hierarchical_layout(real_G), node_size=1500, node_color='blue')
+    #plt.show()
+    #return
+
+    labels, sample1 = simulate_data_from_causal_graph(real_G, 30, 0.5)
+    labels, sample2 = simulate_data_from_causal_graph(real_G, 30, 0.5)
+    #print partial_corr(preprocessing.scale(numpy.hstack((sample1, sample2)).T).T)
+    #return
+    pdag, cond_independence_sets = estimate_pdag(sample1, sample2, labels)
+    plot_pdag(pdag, real_G)
+    #for x in find_all_consistent_dags(
+    #        pdag, cond_independence_sets, real_G):
+    #    print x.edges()
+    #    plot_pdag(x, real_G)
+    
+    return
+
 
 if __name__ == '__main__':
     #main()
